@@ -18,6 +18,9 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.StreamingOptions;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.range.OffsetRange;
+import org.apache.beam.sdk.state.ValueState;
+import org.apache.beam.sdk.state.StateSpec;
+import org.apache.beam.sdk.state.StateSpecs;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -28,6 +31,7 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.joda.time.Duration;
+import org.joda.time.Instant;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONValue;
 import org.json.simple.JSONObject;
@@ -142,7 +146,7 @@ public class App {
         public OffsetRange getInitialRestriction(@Element String repoName) throws IOException {
             // Range represents pull numbers. 
             // return new OffsetRange(1, 10000000);
-            return new OffsetRange(45512, 45520);
+            return new OffsetRange(45512, 45515);
         }
 
         // Providing the coder is only necessary if it can not be inferred at runtime.
@@ -154,14 +158,12 @@ public class App {
         // Process all new pulls from lowest to highest, advancing the watermark as we go (we can probably just use a monotonically increasing watermark).
         // If we reach a number in the restriction that doesn't have a pr associated with it, or we start to get rate limited, self checkpoint.
         @ProcessElement
-        public ProcessContinuation ProcessElement(ProcessContext c, @Element String repoName, RestrictionTracker<OffsetRange, Long> tracker, OutputReceiver<KV<String, String>> out) {
-            // TODO - add in bundle finalization to just log that we've completed processing
+        public ProcessContinuation ProcessElement(ProcessContext c, @Element String repoName, RestrictionTracker<OffsetRange, Long> tracker, OutputReceiver<KV<String, String>> out, BundleFinalizer bundleFinalizer) {
             long i = tracker.currentRestriction().getFrom();
             int retries = 0;
             while (true){
                 try {
                     JSONObject pullBlob = (JSONObject)GetGitHubContent(String.format("https://api.github.com/repos/%s/issues/%s", repoName, i), true);
-                    System.out.println(pullBlob.toString());
 
                     if (tracker.tryClaim(i)) {
                         Object pullInfoBlob = pullBlob.get("pull_request");
@@ -170,27 +172,34 @@ public class App {
                             String author = ((JSONObject)pullBlob.get("user")).get("login").toString();
                             // TODO - get timestamp and associate it with this element
                             // TODO - set up watermark estimator
-                            out.output(KV.of("author:all-repos", author));
-                            out.output(KV.of("body:all-repos:", body));
                             out.output(KV.of("author:" + repoName, author));
                             out.output(KV.of("body:" + repoName, body));
                             System.out.println(KV.of("author", author));
                             System.out.println(KV.of("body", body));
+                            bundleFinalizer.afterBundleCommit(
+                                Instant.now().plus(Duration.standardMinutes(500)),
+                                () -> {
+                                    System.out.println("Persisted results for another pr");
+                                });
                         }
                         i++;
+                    } else {
+                        return ProcessContinuation.stop();
                     }
                     retries = 0;
                 } catch (GitHubResponseException ex) {
                     int responseCode = ex.GetResponseCode();
                     if (responseCode == 404) {
-                        // TODO - also, store that i-1 is the largest PR we can process at the moment in state. Then reference that cached value in splitRestriction.
                         System.out.println("No prs avaialable to process. Checkpointing and waiting for more.");
+                        // TODO - manually set the watermark to the current time.
                         return ProcessContinuation.resume().withResumeDelay(Duration.standardSeconds(120));
                     } else if (responseCode == 403) {
                         System.out.println("Getting throttled. Checkpointing and waiting for rate limits to cool down.");
                         return ProcessContinuation.resume().withResumeDelay(Duration.standardSeconds(1800));
                     } else {
                         if (retries >= 3) {
+                            System.out.println(ex.toString());
+                            System.out.println(ex.GetResponseCode());
                             // If we've already tried this one 3 times, give up and move on to the next element.
                             if (!tracker.tryClaim(i)) {
                                 return ProcessContinuation.stop();
@@ -201,9 +210,6 @@ public class App {
                             retries++;
                         }
                     }
-
-                    System.out.println(ex.toString());
-                    System.out.println(ex.GetResponseCode());
                     i++;
                 } catch (Exception ex) {
                     // TODO
@@ -241,7 +247,10 @@ public class App {
             .apply("Process repo activity", ParDo.of(new ProcessRepoActivity()));
         // TODO - window into
         // TODO - group by key
-        // TODO - extract/format interesting results
+        // TODO - extract interesting results as key values. For each result aggregated across a repo, emit one entry with key <result:author> (if relevant),
+        // one entry with key <result:repo>, and one with key <result:all-repos>
+        // TODO - another group by key
+        // TODO - Format output
         // TODO - write to a file somewhere
 
         pipeline.run();
