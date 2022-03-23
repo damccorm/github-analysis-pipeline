@@ -21,6 +21,7 @@ dependencies {
     implementation "org.apache.beam:beam-sdks-java-core:${beamVersion}"
     implementation "org.apache.beam:beam-runners-direct-java:${beamVersion}"
     implementation "org.slf4j:slf4j-jdk14:1.7.32"
+    implementation 'com.googlecode.json-simple:json-simple:1.1.1'
 
     // Tests dependencies.
     testImplementation "org.junit.jupiter:junit-jupiter:5.8.1"
