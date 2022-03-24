@@ -9,6 +9,7 @@ import java.net.URL;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.concurrent.TimeUnit;
+import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.metrics.Counter;
@@ -16,7 +17,6 @@ import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.options.StreamingOptions;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.range.OffsetRange;
 import org.apache.beam.sdk.state.ValueState;
@@ -48,7 +48,7 @@ import org.json.simple.JSONValue;
 import org.json.simple.JSONObject;
 
 public class App {
-    public interface Options extends StreamingOptions {
+    public interface Options extends DataflowPipelineOptions {
         @Description("The pipeline will process the top NumRepos of repos by stars.")
         @Default.Integer(1)
         int getNumRepos();
