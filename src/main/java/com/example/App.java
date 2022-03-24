@@ -7,6 +7,7 @@ import java.io.InputStreamReader;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.Pipeline;
@@ -23,12 +24,22 @@ import org.apache.beam.sdk.state.StateSpec;
 import org.apache.beam.sdk.state.StateSpecs;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.FlatMapElements;
 import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.Partition;
+import org.apache.beam.sdk.transforms.Partition.PartitionFn;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
+import org.apache.beam.sdk.transforms.splittabledofn.ManualWatermarkEstimator;
+import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimator;
+import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimators.Manual;
+import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
+import org.apache.beam.sdk.transforms.windowing.SlidingWindows;
+import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -43,6 +54,12 @@ public class App {
         int getNumRepos();
 
         void setNumRepos(int value);
+
+        @Description("The folder to write output to.")
+        @Default.String("/tmp/github-analysis")
+        String getOutputFolder();
+
+        void setOutputFolder(String value);
     }
 
     private static class TopNReposFn extends DoFn<String, String> {
@@ -66,7 +83,6 @@ public class App {
             String repoUrl = csvValues[6];
             // We can take advantage of the fact that all urls are prefixed by https://github.com/ (this would not be a good practice outside a hackathon :) )
             repoUrl = repoUrl.substring("https://github.com/".length());
-            System.out.println(repoUrl);
             out.output(repoUrl);
         }
     }
@@ -145,6 +161,7 @@ public class App {
         @GetInitialRestriction
         public OffsetRange getInitialRestriction(@Element String repoName) throws IOException {
             // Range represents pull numbers. 
+            // TODO - flip this to the full range.
             // return new OffsetRange(1, 10000000);
             return new OffsetRange(45512, 45515);
         }
@@ -158,24 +175,22 @@ public class App {
         // Process all new pulls from lowest to highest, advancing the watermark as we go (we can probably just use a monotonically increasing watermark).
         // If we reach a number in the restriction that doesn't have a pr associated with it, or we start to get rate limited, self checkpoint.
         @ProcessElement
-        public ProcessContinuation ProcessElement(ProcessContext c, @Element String repoName, RestrictionTracker<OffsetRange, Long> tracker, OutputReceiver<KV<String, String>> out, BundleFinalizer bundleFinalizer) {
+        public ProcessContinuation ProcessElement(ProcessContext c, @Element String repoName, RestrictionTracker<OffsetRange, Long> tracker, OutputReceiver<KV<String, String>> out, ManualWatermarkEstimator<Instant> watermarkEstimator, BundleFinalizer bundleFinalizer) {
             long i = tracker.currentRestriction().getFrom();
             int retries = 0;
             while (true){
                 try {
                     JSONObject pullBlob = (JSONObject)GetGitHubContent(String.format("https://api.github.com/repos/%s/issues/%s", repoName, i), true);
-
+                    String createTime = pullBlob.get("created_at").toString();
+                    Instant timestamp = new Instant(createTime);
                     if (tracker.tryClaim(i)) {
                         Object pullInfoBlob = pullBlob.get("pull_request");
                         if (pullInfoBlob != null) {
                             String body = pullBlob.get("body").toString();
                             String author = ((JSONObject)pullBlob.get("user")).get("login").toString();
-                            // TODO - get timestamp and associate it with this element
-                            // TODO - set up watermark estimator
-                            out.output(KV.of("author:" + repoName, author));
-                            out.output(KV.of("body:" + repoName, body));
-                            System.out.println(KV.of("author", author));
-                            System.out.println(KV.of("body", body));
+                            out.outputWithTimestamp(KV.of("author:" + author, repoName), timestamp);
+                            out.outputWithTimestamp(KV.of("body:" + repoName, body), timestamp);
+                            watermarkEstimator.setWatermark(timestamp);
                             bundleFinalizer.afterBundleCommit(
                                 Instant.now().plus(Duration.standardMinutes(500)),
                                 () -> {
@@ -191,7 +206,8 @@ public class App {
                     int responseCode = ex.GetResponseCode();
                     if (responseCode == 404) {
                         System.out.println("No prs avaialable to process. Checkpointing and waiting for more.");
-                        // TODO - manually set the watermark to the current time.
+                        // Advance the watermark to the current time
+                        watermarkEstimator.setWatermark(new Instant());
                         return ProcessContinuation.resume().withResumeDelay(Duration.standardSeconds(120));
                     } else if (responseCode == 403) {
                         System.out.println("Getting throttled. Checkpointing and waiting for rate limits to cool down.");
@@ -212,16 +228,15 @@ public class App {
                     }
                     i++;
                 } catch (Exception ex) {
-                    // TODO
+                    // TODO - more robust error handling. For now, just try again
                     System.out.println(ex.toString());
                 }
             }
-            // out.output(KV.of("test", repoToPullRangeMapping.getKey()));
-            // System.out.println(KV.of("test", repoToPullRangeMapping.getKey()));
         }
 
         @SplitRestriction
         public void splitRestriction(@Element String repoName, @Restriction OffsetRange restriction, OutputReceiver<OffsetRange> splitReceiver) {
+            // This might have been simplified with a growable offset range tracker
             // We don't want to split larger than the largest pull.
             int largestPull = GetLargestPull(repoName, true);
             long splitSize = 10;
@@ -235,6 +250,67 @@ public class App {
             // Output the last range
             splitReceiver.output(new OffsetRange(i, restriction.getTo()));
         }
+
+        @GetInitialWatermarkEstimatorState
+        public Instant getInitialWatermarkEstimatorState() {
+            return new Instant(0);
+        }
+
+        @NewWatermarkEstimator
+        public WatermarkEstimator<Instant> newWatermarkEstimator(@WatermarkEstimatorState Instant watermarkEstimatorState) {
+            return new Manual(watermarkEstimatorState);
+        }
+    }
+
+    // TODO - remove extraneous terms used for testing.
+    static String[] termsToCheck = new String[]{"beam", "apache", "streaming pipeline", "checklist", "crowdin"};
+
+    private static class ExtractResultMetrics extends DoFn<KV<String, Iterable<String>>, KV<String, Integer>> {
+        @ProcessElement
+        public void ProcessElement(ProcessContext c, @Element KV<String, Iterable<String>> metricsMapping, OutputReceiver<KV<String, Integer>> out) {
+            int numValues = ((Collection<String>)metricsMapping.getValue()).size();
+            if (metricsMapping.getKey().startsWith("author:")) {
+                out.output(KV.of(metricsMapping.getKey(), numValues));
+            } else if (metricsMapping.getKey().startsWith("body:")) {
+                String repoName = metricsMapping.getKey().split(":", 0)[1];
+                out.output(KV.of("numPulls:" + repoName, numValues));
+                out.output(KV.of("numPulls:all-repos", numValues));
+                for (String term : termsToCheck) {
+                    int occurrences = 0;
+                    for (String body : (Collection<String>)metricsMapping.getValue()) {
+                        if (body.toLowerCase().contains(term.toLowerCase())) {
+                            occurrences++;
+                        }
+                    }
+                    if (occurrences > 0) {
+                        out.output(KV.of(String.format("mentions:%s:%s", term, repoName), occurrences));
+                        out.output(KV.of(String.format("mentions:%s:all-repos", term), occurrences));
+                    }
+                }
+            }
+        }
+    }
+
+    private static class CondenseMetrics extends DoFn<KV<String, Iterable<Integer>>, KV<String, Integer>> {
+        @ProcessElement
+        public void ProcessElement(ProcessContext c, @Element KV<String, Iterable<Integer>> metricsMapping, OutputReceiver<KV<String, Integer>> out) {
+            int sum = 0;
+            for (Integer value : (Collection<Integer>)metricsMapping.getValue()) {
+                sum += value;
+            }
+            out.output(KV.of(metricsMapping.getKey(), sum));
+        }
+    }
+
+    private static class FormatElements extends DoFn<KV<String, Integer>, String> {
+        @ProcessElement
+        public void ProcessElement(ProcessContext c, @Element KV<String, Integer> metricsMapping, OutputReceiver<String> out, BoundedWindow w) {
+            System.out.println(w.toString());
+            String key = metricsMapping.getKey();
+            String identifier = key.substring(key.indexOf(":"));
+
+            out.output(identifier + ": " + metricsMapping.getValue());
+        }
     }
 
     public static void main(String[] args) {
@@ -242,16 +318,45 @@ public class App {
         options.setStreaming(true);
 
         var pipeline = Pipeline.create(options);
-        pipeline.apply(TextIO.read().from("/Users/dannymccormick/Downloads/repos.csv"))
+        PCollectionList<KV<String, Integer>> results = pipeline.apply(TextIO.read().from("/Users/dannymccormick/Downloads/repos.csv"))
             .apply("Extract top repos", ParDo.of(new TopNReposFn()))
-            .apply("Process repo activity", ParDo.of(new ProcessRepoActivity()));
-        // TODO - window into
-        // TODO - group by key
-        // TODO - extract interesting results as key values. For each result aggregated across a repo, emit one entry with key <result:author> (if relevant),
-        // one entry with key <result:repo>, and one with key <result:all-repos>
-        // TODO - another group by key
-        // TODO - Format output
-        // TODO - write to a file somewhere
+            .apply("Process repo activity", ParDo.of(new ProcessRepoActivity()))
+            // Don't allow late data - it should be impossible given the structure of our transforms/watermarks.
+            // TODO - consider a custom trigger (I don't think it buys much, but it would be an interesting exercise).
+            .apply("Apply windowing strategy", Window.<KV<String, String>>into(SlidingWindows.of(Duration.standardSeconds(60000)).every(Duration.standardSeconds(15000))))
+            .apply("Group by key", GroupByKey.create())
+            .apply("Extract results from activity", ParDo.of(new ExtractResultMetrics()))
+            .apply("Group by key", GroupByKey.create())
+            .apply("Extract results from activity", ParDo.of(new CondenseMetrics()))
+            .apply(Partition.of(3, new PartitionFn<KV<String, Integer>>() {
+                public int partitionFor(KV<String, Integer> metricsMapping, int numPartitions) {
+                    if (metricsMapping.getKey().startsWith("author:")) {
+                        return 0;
+                    } else if (metricsMapping.getKey().startsWith("numPulls:")) {
+                        return 1;
+                    }
+                    return 2;
+                }}));
+
+        PCollection<KV<String, Integer>> authorResults = results.get(0);
+        PCollection<KV<String, Integer>> pullResults = results.get(1);
+        PCollection<KV<String, Integer>> mentionResults = results.get(2);
+        String outputFolder = options.getOutputFolder();
+        if (outputFolder.charAt(outputFolder.length()-1) != '/') {
+            outputFolder += "/";
+        }
+        authorResults
+            .apply("Format elements", ParDo.of(new FormatElements()))
+            .apply(TextIO.write().withWindowedWrites().withNumShards(1).to(outputFolder + "author/authorResults.txt"));
+        pullResults
+            .apply("Format elements", ParDo.of(new FormatElements()))
+            .apply(TextIO.write().withWindowedWrites().withNumShards(1).to(outputFolder + "pull/pullResults.txt"));
+        mentionResults
+            .apply("Format elements", ParDo.of(new FormatElements()))
+            .apply(TextIO.write().withWindowedWrites().withNumShards(1).to(outputFolder + "mentions/mentionResults.txt"));
+
+        // TODO - consider adding some custom metrics - https://beam.apache.org/documentation/programming-guide/#metrics
+        // TODO - is there a way to utilize state/timers?
 
         pipeline.run();
     }
